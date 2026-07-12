@@ -107,6 +107,7 @@ class ParanoidSmaliDeobfuscator:
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.file.close()
+        self.tmp_file.close()
 
     def process(self, line: str, line_num: int) -> str | None:
         # Reset the state if the result from the getString method is not used

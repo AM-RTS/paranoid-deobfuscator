@@ -410,6 +410,13 @@ class ParanoidSmaliParser:
 
             # Append the value to the array
             array.value[index.value] = value.value
+
+            # Propagate the updated array to any field that references this register.
+            # This is needed when sput-object runs before the array is filled.
+            for f_data in self.fields.values():
+                if f_data["_register"] == instr.register_array:
+                    f_data["value"] = array.value
+
             return
 
         if line.startswith("invoke-static"):

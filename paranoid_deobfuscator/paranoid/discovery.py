@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import pathlib
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Set, Tuple
 
 from .. import constants
 from ..encoding import decode_unicode_chunks
@@ -68,14 +68,44 @@ class DiscoveryError(Exception):
     """Raised when Paranoid targets cannot be resolved cleanly."""
 
 
+def _is_get_string_wrapper(method: SmaliMethod, data: dict) -> bool:
+    """Return True if the method structurally looks like a Paranoid getString wrapper.
+
+    A wrapper is any ``static (J) -> String`` method that references exactly one
+    ``String[]`` field via ``sget-object`` **and** that field belongs to the same
+    class.  This catches both the classic const-signature pattern and thin wrappers
+    that delegate to a separate deobfuscator helper.
+    """
+    if "static" not in method.modifiers:
+        return False
+    if method.arguments != constants.PARANOID_GET_STRING_ARGUMENTS:
+        return False
+    if method.return_type != constants.PARANOID_GET_STRING_RETURN_TYPE:
+        return False
+
+    string_array_sgets = [s for s in data.get("sget_objects", []) if s.type == "[Ljava/lang/String;"]
+    if len(string_array_sgets) != 1:
+        return False
+
+    field = string_array_sgets[0]
+    return field.class_name == method.class_name
+
+
 def discover_get_string_targets(target_directory: pathlib.Path | str) -> List[GetStringTarget]:
     """
     Scan smali sources and return every valid Paranoid getString target.
 
-    A method is considered a getString candidate when its const signature, argument
-    list, and return type match the known Paranoid helper pattern. Each candidate
-    must reference exactly one static ``String[]`` field whose initializer is present
-    in a ``<clinit>`` of the same class.
+    Detection works in two tiers:
+
+    1. **Exact const-signature match** — the classic Paranoid v0.3+ pattern where
+       the method body begins with a specific sequence of ``const-wide`` values.
+    2. **Structural match** — any ``static (J) -> String`` method whose body
+       references exactly one ``String[]`` field in its own class via
+       ``sget-object``.  This catches thin wrapper variants that lack the const
+       signature but still follow the standard LSParanoid deobfuscation algorithm.
+
+    Each candidate is paired with the initializer of its ``String[]`` field
+    (extracted from the ``<clinit>`` of the same class).
     """
     # Local import avoids a circular dependency with paranoid.__init__.
     from . import ParanoidSmaliParser
@@ -84,6 +114,7 @@ def discover_get_string_targets(target_directory: pathlib.Path | str) -> List[Ge
 
     potential_get_string_methods: List[Tuple[SmaliMethod, List[SmaliField]]] = []
     potential_obfuscated_string_arrays: List[Tuple[SmaliField, List[str]]] = []
+    seen_identities: Set[MethodIdentity] = set()
 
     for smali_file in target_directory.rglob("*.smali"):
         with open(smali_file, "r", encoding="utf-8", errors="replace") as f:
@@ -93,12 +124,37 @@ def discover_get_string_targets(target_directory: pathlib.Path | str) -> List[Ge
                 smali_parser.update(line, line_num)
 
             for method, data in smali_parser.methods.items():
+                identity = method_identity(method)
+                if identity in seen_identities:
+                    continue
+
+                matched = False
+                # Tier 1: exact const-signature match (classic Paranoid v0.3+)
                 if (
                     data["consts"] == constants.PARANOID_GET_STRING_CONST_SIGNATURE
                     and method.arguments == constants.PARANOID_GET_STRING_ARGUMENTS
                     and method.return_type == constants.PARANOID_GET_STRING_RETURN_TYPE
                 ):
                     potential_get_string_methods.append((method, data["sget_objects"]))
+                    matched = True
+
+                # Tier 2: structural fallback for wrapper variants
+                if not matched and _is_get_string_wrapper(method, data):
+                    string_array_sgets = [
+                        s for s in data.get("sget_objects", []) if s.type == "[Ljava/lang/String;"
+                    ]
+                    logger.debug(
+                        "Structural match: %s->%s references %s->%s",
+                        method.class_name,
+                        method.method,
+                        string_array_sgets[0].class_name,
+                        string_array_sgets[0].name,
+                    )
+                    potential_get_string_methods.append((method, [string_array_sgets[0]]))
+                    matched = True
+
+                if matched:
+                    seen_identities.add(identity)
 
             for field, data in smali_parser.fields.items():
                 if field.type == "[Ljava/lang/String;":
