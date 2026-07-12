@@ -7,10 +7,15 @@
 > Currently not working on Windows. Please use WSL or a Linux VM. See [#14](https://github.com/giacomoferretti/paranoid-deobfuscator/issues/14).
 -->
 > [!NOTE]
-> Only compatible with Paranoid v0.3.0+ (released in 25 Jan 2020)
+> Compatible with Paranoid v0.3.0+ and LSParanoid variants.
+> Uses structural detection when const signatures differ.
 >
 
-A script to deobfuscate apps obfuscated with [Paranoid]/[LSParanoid] to help you with static analysis.
+Deobfuscates string encryption applied by [Paranoid] and [LSParanoid].
+
+- **Two-tier detection**: exact const-signature match for classic Paranoid v0.3+, plus structural fallback for wrapper variants.
+- **Multi-method support**: handles APKs with multiple getString helpers, each with its own chunk array.
+- **Windows-compatible**: `NamedTemporaryFile` handles are properly closed before file replacement.
 
 |            Before             |            After            |
 | :---------------------------: | :-------------------------: |
