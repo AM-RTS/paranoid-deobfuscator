@@ -30,9 +30,10 @@ from ..smali import register
 
 logger = logging.getLogger(__name__)
 
-REMOVED_COMMENT = (
-    f"    # Removed with https://github.com/giacomoferretti/paranoid-deobfuscator - v{deobfuscator_version}"
-)
+# Private sentinel returned by ParanoidSmaliDeobfuscator.process() when a
+# getString invoke-static call is removed.  The update() method uses this to
+# optionally drop the preceding dead const that loaded the obfuscated ID.
+_REMOVED_GETSTRING = "<<REMOVED_GETSTRING>>"
 
 
 class ParanoidSmaliDeobfuscator:
@@ -45,13 +46,11 @@ class ParanoidSmaliDeobfuscator:
     class ParanoidSmaliDeobfuscatorError(Exception):
         def __init__(self, message: str, extra: Dict[str, Any] = {}):
             super().__init__(message)
-
             self.extra = extra
 
         def __str__(self):
             if not self.extra:
                 return super().__str__()
-
             return f"{super().__str__()}\n{json.dumps(self.extra, indent=4, cls=ParanoidSmaliDeobfuscator.SmaliRegisterEncoder)}"
 
     class State(TypedDict):
@@ -64,13 +63,8 @@ class ParanoidSmaliDeobfuscator:
         self,
         filepath: pathlib.Path | str,
         targets: Sequence[paranoid.GetStringTarget],
-        # edit_in_place: bool = True,
     ):
         self.filepath = filepath
-        # if edit_in_place:
-        #     self.file = open(filepath, "r+")
-        # else:
-        #     self.file = open(filepath, "r")
         self.file = open(filepath, "r", encoding="utf-8", errors="replace")
         self.tmp_file = NamedTemporaryFile(
             mode="wt",
@@ -80,6 +74,17 @@ class ParanoidSmaliDeobfuscator:
         )
 
         self.targets_by_identity = paranoid.targets_by_identity(targets)
+
+        # Deferred-output buffer for dead-const cleanup.
+        # When we see a const(-wide) that might be a getString argument,
+        # we buffer it instead of writing immediately.  If the very next
+        # meaningful line is a removed getString targeting the same
+        # register, the whole buffer is dropped.  Otherwise it is flushed.
+        self._pending_lines: List[str] = []
+        self._pending_const_reg: str | None = None
+
+        self._removed_getstring_reg: str | None = None
+
         self._reset_state()
 
     def _reset_state(self, key_to_reset: str | None = None):
@@ -89,17 +94,30 @@ class ParanoidSmaliDeobfuscator:
             "last_deobfuscated_string": None,
             "inside_try_block": False,
         }
-
         if key_to_reset:
             self.state[key_to_reset] = default_state[key_to_reset]
         else:
             self.state = default_state
 
+    # ------------------------------------------------------------------
+    # Output buffering helpers
+    # ------------------------------------------------------------------
+
+    def _flush_pending(self) -> None:
+        """Write every buffered line to the temporary file and clear state."""
+        if self._pending_lines:
+            self.tmp_file.writelines(self._pending_lines)
+            self._pending_lines = []
+        self._pending_const_reg = None
+
+    # ------------------------------------------------------------------
+    # Line-level processing
+    # ------------------------------------------------------------------
+
     @staticmethod
     def get_fully_qualified_class_name(line: str) -> str:
         if not line.startswith(".class"):
             raise Exception("Line does not start with .class")
-
         return line.split()[-1]
 
     def __enter__(self):
@@ -133,14 +151,12 @@ class ParanoidSmaliDeobfuscator:
                 instr = paranoid.instructions.SmaliInstrConst.parse(line)
             except ValueError:
                 return
-
             self.state["registers"][instr.register] = paranoid.register.SmaliRegisterConst(instr.value)
             return
 
         # Search for calls to any discovered getString method
         if line.startswith("invoke-static"):
             try:
-                # Try to parse invoke-static/range first
                 instr = paranoid.instructions.SmaliInstrInvokeStaticRange.parse(line)
                 instr = paranoid.instructions.SmaliInstrInvokeStatic(
                     instr.registers, instr.class_name, instr.method, instr._raw
@@ -164,12 +180,8 @@ class ParanoidSmaliDeobfuscator:
 
             first_register = instr.registers[0]
 
-            # Get the value of the register
             register_value = self.state["registers"].get(first_register)
 
-            # TODO: parameters are not supported
-            # This is a limitation of the current implementation.
-            # It is possible to support them, but it would require a more complex approach.
             if first_register.startswith("p") and not register_value:
                 raise ParanoidSmaliDeobfuscator.ParanoidSmaliDeobfuscatorError(
                     "Parameters are not supported",
@@ -190,7 +202,6 @@ class ParanoidSmaliDeobfuscator:
                     },
                 )
 
-            # Check if the register is a constant
             if not isinstance(register_value, paranoid.register.SmaliRegisterConst):
                 raise ParanoidSmaliDeobfuscator.ParanoidSmaliDeobfuscatorError(
                     "Register is not a constant",
@@ -201,16 +212,17 @@ class ParanoidSmaliDeobfuscator:
                     },
                 )
 
-            # Deobfuscate the string using the chunk array paired with this method
             deobfuscated_string = paranoid.deobfuscate_string(register_value.value, target.chunks, True)
             self.state["last_deobfuscated_string"] = deobfuscated_string
 
-            # Edge case: if we are inside a try block, we need to have at least one valid instruction,
-            # so we add a nop instruction, otherwise the smali file will be invalid and the APK will recompile
-            if self.state["inside_try_block"]:
-                return f"    nop {REMOVED_COMMENT.strip()}"
+            # Remember which register held the obfuscated ID so update()
+            # can drop the preceding dead const from the output buffer.
+            self._removed_getstring_reg = first_register
 
-            return REMOVED_COMMENT
+            if self.state["inside_try_block"]:
+                return "    nop"
+
+            return _REMOVED_GETSTRING
 
         # Move result object
         if line.startswith("move-result-object"):
@@ -228,34 +240,75 @@ class ParanoidSmaliDeobfuscator:
 
         return
 
+    # ------------------------------------------------------------------
+    # Line dispatch (called by the outer loop)
+    # ------------------------------------------------------------------
+
     def update(self, _line: str, line_num: int = 0):
-        line = _line.strip()
+        """Process one smali line and write the result to the temporary file."""
+        line_s = _line.strip()
 
-        # Skip empty lines
-        if not line:
-            self.tmp_file.write(_line)
-            return
-
-        # Process the line
+        # --- run the deobfuscation logic first ---------------------------------
         try:
-            updated_line = self.process(line, line_num)
-            if updated_line is not None:
-                self.tmp_file.write(updated_line + "\n")
-                return
+            result = self.process(line_s, line_num)
         except ParanoidSmaliDeobfuscator.ParanoidSmaliDeobfuscatorError as e:
-            # Ignore Parameters are not supported
             if e.args[0] == "Parameters are not supported":
                 logger.warning(f"{self.filepath}:{line_num+1}: Detected unsupported method call")
-                # Add the line to the temporary file
+                self._flush_pending()
                 self.tmp_file.write(_line)
                 return
-
-            # Log and raise the error
             logger.error(report_github_issue_message(str(e)))
             raise e
 
-        # Add the line to the temporary file
-        self.tmp_file.write(_line)
+        # --- handle a removed getString call -----------------------------------
+        if result == _REMOVED_GETSTRING:
+            removed_reg = self._removed_getstring_reg
+            if removed_reg is not None and self._pending_const_reg == removed_reg:
+                # The buffered const was dead — drop it and any blank lines
+                # that followed it.
+                self._pending_lines = []
+                self._pending_const_reg = None
+            else:
+                # No matching buffered const — just flush whatever we have.
+                self._flush_pending()
+            return
+
+        # --- blank lines -------------------------------------------------------
+        if not line_s:
+            if self._pending_lines:
+                # Defer blank lines when a const is buffered — they might
+                # sit between the const and a getString call.
+                self._pending_lines.append(_line)
+                return
+            self.tmp_file.write(_line)
+            return
+
+        # --- const / const-wide lines (integer constants only) ------------------
+        if line_s.startswith("const") and result is None:
+            # result is None means process() kept the line as-is.
+            # Check whether SmaliInstrConst can parse it (primitives only,
+            # not const-string).
+            try:
+                instr = paranoid.instructions.SmaliInstrConst.parse(line_s)
+                const_reg = instr.register
+            except ValueError:
+                const_reg = None
+
+            if const_reg is not None:
+                # Start a new deferred buffer in case this const feeds a
+                # getString call on the very next meaningful line.
+                self._flush_pending()
+                self._pending_lines = [_line]
+                self._pending_const_reg = const_reg
+                return
+
+        # --- everything else ---------------------------------------------------
+        self._flush_pending()
+
+        if result is not None:
+            self.tmp_file.write(result + "\n")
+        else:
+            self.tmp_file.write(_line)
 
 
 @click.command(name="deobfuscate", help="Deobfuscate a paranoid obfuscated APK smali files")
