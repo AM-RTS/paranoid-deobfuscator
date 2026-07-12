@@ -1,4 +1,5 @@
 # Copyright 2024 Giacomo Ferretti
+# Copyright 2026 Contributors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,13 +19,13 @@ import pathlib
 import shutil
 import sys
 from tempfile import NamedTemporaryFile
-from typing import Any, Dict, List, TypedDict
+from typing import Any, Dict, List, Sequence, TypedDict
 
 import click
 
 from .. import __version__ as deobfuscator_version
-from .. import constants, paranoid, report_github_issue_message
-from ..encoding import decode_unicode_chunks, encode_smali_string
+from .. import paranoid, report_github_issue_message
+from ..encoding import encode_smali_string
 from ..smali import register
 
 logger = logging.getLogger(__name__)
@@ -62,8 +63,7 @@ class ParanoidSmaliDeobfuscator:
     def __init__(
         self,
         filepath: pathlib.Path | str,
-        target_method: paranoid.SmaliMethod,
-        obfuscated_chunks: List[str],
+        targets: Sequence[paranoid.GetStringTarget],
         # edit_in_place: bool = True,
     ):
         self.filepath = filepath
@@ -71,11 +71,15 @@ class ParanoidSmaliDeobfuscator:
         #     self.file = open(filepath, "r+")
         # else:
         #     self.file = open(filepath, "r")
-        self.file = open(filepath, "r")
-        self.tmp_file = NamedTemporaryFile(mode="wt", dir=pathlib.Path(filepath).parent.absolute(), delete=False)
+        self.file = open(filepath, "r", encoding="utf-8", errors="replace")
+        self.tmp_file = NamedTemporaryFile(
+            mode="wt",
+            dir=pathlib.Path(filepath).parent.absolute(),
+            delete=False,
+            encoding="utf-8",
+        )
 
-        self.target_method = target_method
-        self.obfuscated_chunks = obfuscated_chunks
+        self.targets_by_identity = paranoid.targets_by_identity(targets)
         self._reset_state()
 
     def _reset_state(self, key_to_reset: str | None = None):
@@ -132,7 +136,7 @@ class ParanoidSmaliDeobfuscator:
             self.state["registers"][instr.register] = paranoid.register.SmaliRegisterConst(instr.value)
             return
 
-        # Search for calls to the target method
+        # Search for calls to any discovered getString method
         if line.startswith("invoke-static"):
             try:
                 # Try to parse invoke-static/range first
@@ -150,15 +154,11 @@ class ParanoidSmaliDeobfuscator:
                 instr.method
             )
 
-            # Check if the target method is the one we are looking for
-            if not (
-                self.target_method
-                and instr.class_name == self.target_method.class_name
-                and method_name == self.target_method.method
-                and method_arguments == self.target_method.arguments
-                and method_return_type == self.target_method.return_type
-                and len(instr.registers) == 2
-            ):
+            identity = paranoid.method_identity_from_parts(
+                instr.class_name, method_name, method_arguments, method_return_type
+            )
+            target = self.targets_by_identity.get(identity)
+            if not target or len(instr.registers) != 2:
                 return
 
             first_register = instr.registers[0]
@@ -200,8 +200,8 @@ class ParanoidSmaliDeobfuscator:
                     },
                 )
 
-            # Deobfuscate the string
-            deobfuscated_string = paranoid.deobfuscate_string(register_value.value, self.obfuscated_chunks, True)
+            # Deobfuscate the string using the chunk array paired with this method
+            deobfuscated_string = paranoid.deobfuscate_string(register_value.value, target.chunks, True)
             self.state["last_deobfuscated_string"] = deobfuscated_string
 
             # Edge case: if we are inside a try block, we need to have at least one valid instruction,
@@ -262,67 +262,22 @@ class ParanoidSmaliDeobfuscator:
 def cli(target: str):
     target_directory = pathlib.Path(target)
 
-    # First pass: find the get string method and the obfuscated string array
-    potential_get_string_methods = []
-    potential_obfuscated_string_arrays = []
-    for smali_file in target_directory.rglob("*.smali"):
-        with open(smali_file, "r") as f:
-            smali_parser = paranoid.ParanoidSmaliParser(filename=str(smali_file))
-
-            for line_num, line in enumerate(f):
-                smali_parser.update(line, line_num)
-
-            # Add potential get string methods
-            for method, data in smali_parser.methods.items():
-                if (
-                    data["consts"] == constants.PARANOID_GET_STRING_CONST_SIGNATURE
-                    and method.arguments == constants.PARANOID_GET_STRING_ARGUMENTS
-                    and method.return_type == constants.PARANOID_GET_STRING_RETURN_TYPE
-                ):
-                    potential_get_string_methods.append((method, data["sget_objects"]))
-
-            # Add potential obfuscated string arrays
-            for field, data in smali_parser.fields.items():
-                if field.type == "[Ljava/lang/String;":
-                    potential_obfuscated_string_arrays.append((field, data["value"]))
-
-    # Check if only one method is found
-    if len(potential_get_string_methods) != 1:
-        logger.error("Found more than one potential get string method")
-        logger.error("This is not supported yet")
+    # First pass: find all getString methods and their obfuscated string arrays
+    try:
+        targets = paranoid.discover_get_string_targets(target_directory)
+    except paranoid.DiscoveryError as e:
+        logger.error(str(e))
         sys.exit(1)
 
-    get_string_method, get_string_fields = potential_get_string_methods[0]
-    get_string_field: paranoid.SmaliField = get_string_fields[0]
+    logger.info("Found %d getString method(s)", len(targets))
+    for get_string_target in targets:
+        logger.debug("Method: %s", get_string_target.method)
+        logger.debug("Field: %s", get_string_target.field)
+        logger.debug("Chunks: %d", len(get_string_target.chunks))
 
-    # Check if only one field is found
-    if len(get_string_fields) != 1:
-        logger.error("Found more than one potential obfuscated string array")
-        logger.error("This is not supported yet")
-        sys.exit(1)
-
-    # Extract the string chunks
-    chunks = []
-    for field, value in potential_obfuscated_string_arrays:
-        if field.class_name == get_string_field.class_name and field.name == get_string_field.name:
-            chunks = value
-
-    # Check if the chunks are found
-    if not chunks:
-        logger.error("No chunks found")
-        return
-
-    logger.debug(f"Method: {get_string_method}")
-    logger.debug(f"Field: {get_string_field}")
-    logger.debug("Chunks:")
-    logger.debug(chunks)
-
-    # Decode the chunks
-    chunks = decode_unicode_chunks(chunks)
-
-    # Second pass: deobfuscate file
+    # Second pass: deobfuscate file, rewriting calls to any discovered target
     for smali_file in target_directory.rglob("*.smali"):
-        with ParanoidSmaliDeobfuscator(smali_file, get_string_method, chunks) as deobfuscator:
+        with ParanoidSmaliDeobfuscator(smali_file, targets) as deobfuscator:
             for line_num, line in enumerate(deobfuscator.file):
                 deobfuscator.update(line, line_num)
 

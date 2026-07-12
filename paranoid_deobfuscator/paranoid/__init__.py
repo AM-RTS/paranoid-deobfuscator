@@ -18,9 +18,28 @@ from typing import Any, Dict, List, Literal, TypedDict, overload
 
 from ..smali import SmaliField, SmaliMethod, instructions, register
 from . import DeobfuscatorHelper, RandomHelper
+from .discovery import (
+    DiscoveryError,
+    GetStringTarget,
+    MethodIdentity,
+    discover_get_string_targets,
+    method_identity,
+    method_identity_from_parts,
+    targets_by_identity,
+)
 
 # Expose the following classes and functions to the outside world
-__all__ = ["DeobfuscatorHelper", "RandomHelper"]
+__all__ = [
+    "DeobfuscatorHelper",
+    "RandomHelper",
+    "DiscoveryError",
+    "GetStringTarget",
+    "MethodIdentity",
+    "discover_get_string_targets",
+    "method_identity",
+    "method_identity_from_parts",
+    "targets_by_identity",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -63,13 +82,13 @@ class ParanoidSmaliParser:
         class_name (str | None): The fully qualified name of the class being parsed.
         fields (Dict[SmaliField, ParanoidSmaliParser.Field]): A dictionary mapping SmaliField instances to their corresponding field data.
         methods (Dict[SmaliMethod, ParanoidSmaliParser.Method]): A dictionary mapping SmaliMethod instances to their corresponding method data.
-        target_method (SmaliMethod | None): The target method to look for during parsing.
+        target_methods (Dict[MethodIdentity, SmaliMethod]): Target methods to track during parsing.
         _metadata (str): The filename of the Smali file being parsed.
         state (ParanoidSmaliParser.State): The current state of the deobfuscation process.
 
     Methods:
-        __init__(filename: str, target_method: SmaliMethod | None = None):
-            Initializes the parser with the given filename and optional target method.
+        __init__(filename: str, target_method: SmaliMethod | None = None, target_methods: List[SmaliMethod] | None = None):
+            Initializes the parser with the given filename and optional target method(s).
 
         _reset_state(key_to_reset: str | None = None):
             Resets the parser state to its default values or resets a specific key in the state.
@@ -114,7 +133,7 @@ class ParanoidSmaliParser:
             in_static_constructor (bool): Indicates if the current context is within a static constructor.
             current_method (SmaliMethod | None): The current method being processed, or None if not applicable.
             registers (Dict[str, register.SmaliRegister]): A dictionary mapping register names to their corresponding SmaliRegister objects.
-            calls_to_target_method (List[Any]): A list of calls to the target method.
+            calls_to_target_method (List[Any]): A list of (register_value, method_identity) calls to target methods.
         """
 
         in_method: bool
@@ -123,12 +142,27 @@ class ParanoidSmaliParser:
         registers: Dict[str, register.SmaliRegister]
         calls_to_target_method: List[Any]
 
-    def __init__(self, *, filename: str, target_method: SmaliMethod | None = None):
+    def __init__(
+        self,
+        *,
+        filename: str,
+        target_method: SmaliMethod | None = None,
+        target_methods: List[SmaliMethod] | None = None,
+    ):
         self.class_name: str | None = None
         self.fields: Dict[SmaliField, ParanoidSmaliParser.Field] = {}
         self.methods: Dict[SmaliMethod, ParanoidSmaliParser.Method] = {}
 
-        self.target_method = target_method
+        # Prefer an explicit multi-method list; still accept a single target_method for compatibility.
+        methods: List[SmaliMethod] = list(target_methods) if target_methods else []
+        if target_method is not None and target_method not in methods:
+            methods.append(target_method)
+
+        self.target_methods: Dict[MethodIdentity, SmaliMethod] = {
+            method_identity(method): method for method in methods
+        }
+        # Keep the legacy attribute name for callers/tests that still expect it.
+        self.target_method = methods[0] if len(methods) == 1 else None
         self._metadata = filename
 
         self._reset_state()
@@ -391,15 +425,11 @@ class ParanoidSmaliParser:
 
             method_name, method_arguments, method_return_type = SmaliMethod.parse_method_signature(instr.method)
 
-            # Check if the target method is the one we are looking for
-            if not (
-                self.target_method
-                and instr.class_name == self.target_method.class_name
-                and method_name == self.target_method.method
-                and method_arguments == self.target_method.arguments
-                and method_return_type == self.target_method.return_type
-                and len(instr.registers) == 2
-            ):
+            # Check if the invoke matches any configured getString target method.
+            identity = method_identity_from_parts(
+                instr.class_name, method_name, method_arguments, method_return_type
+            )
+            if not self.target_methods or identity not in self.target_methods or len(instr.registers) != 2:
                 return
 
             first_register = instr.registers[0]
@@ -409,7 +439,7 @@ class ParanoidSmaliParser:
             # It is possible to support them, but it would require a more complex approach.
             if first_register.startswith("p"):
                 try:
-                    self.state["calls_to_target_method"].append(self.state["registers"][first_register])
+                    self.state["calls_to_target_method"].append((self.state["registers"][first_register], identity))
                 except KeyError:
                     raise ParanoidSmaliParserError(
                         "Parameters are not supported",
@@ -419,9 +449,10 @@ class ParanoidSmaliParser:
                             "line": line,
                         },
                     )
+                return
 
             try:
-                self.state["calls_to_target_method"].append(self.state["registers"][first_register])
+                self.state["calls_to_target_method"].append((self.state["registers"][first_register], identity))
             except KeyError:
                 raise ParanoidSmaliParserError(
                     "Register not found",

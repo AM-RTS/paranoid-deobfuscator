@@ -1,4 +1,5 @@
 # Copyright 2024 Giacomo Ferretti
+# Copyright 2026 Contributors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,11 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import tempfile
 
 import numpy as np
 import pytest
 
-from paranoid_deobfuscator.paranoid import DeobfuscatorHelper, RandomHelper, utils
+from paranoid_deobfuscator.paranoid import (
+    DeobfuscatorHelper,
+    GetStringTarget,
+    RandomHelper,
+    method_identity,
+    method_identity_from_parts,
+    targets_by_identity,
+    utils,
+)
+from paranoid_deobfuscator.smali import SmaliField, SmaliMethod
 
 
 @pytest.mark.parametrize(
@@ -95,6 +106,166 @@ def paranoid_obfuscated_chunks():
 )
 def test_paranoid_DeobfuscatorHelper_getString(paranoid_obfuscated_chunks, input, expected_result):
     assert DeobfuscatorHelper.getString(input, paranoid_obfuscated_chunks) == expected_result
+
+
+# ---------------------------------------------------------------------------
+# Discovery helpers
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def sample_targets():
+    """Create synthetic GetStringTarget instances for testing."""
+    method_a = SmaliMethod(
+        "a",
+        arguments=["J"],
+        return_type="Ljava/lang/String;",
+        modifiers=["static"],
+        class_name="Lcom/example/A;",
+    )
+    field_a = SmaliField(
+        "encryptedStrings",
+        type="[Ljava/lang/String;",
+        modifiers=["static"],
+        class_name="Lcom/example/A;",
+    )
+    chunks_a = ["\u0003foo\u0003bar"]
+
+    method_b = SmaliMethod(
+        "getString",
+        arguments=["J"],
+        return_type="Ljava/lang/String;",
+        modifiers=["static"],
+        class_name="Lcom/example/B;",
+    )
+    field_b = SmaliField(
+        "encryptedStrings",
+        type="[Ljava/lang/String;",
+        modifiers=["static"],
+        class_name="Lcom/example/B;",
+    )
+    chunks_b = ["\u0003baz\u0003qux"]
+
+    return [
+        GetStringTarget(method=method_a, field=field_a, chunks=chunks_a),
+        GetStringTarget(method=method_b, field=field_b, chunks=chunks_b),
+    ]
+
+
+def test_method_identity():
+    method = SmaliMethod(
+        "helper",
+        arguments=["J"],
+        return_type="Ljava/lang/String;",
+        class_name="Lfoo/Bar;",
+    )
+    identity = method_identity(method)
+    assert identity == ("Lfoo/Bar;", "helper", ("J",), "Ljava/lang/String;")
+
+
+def test_method_identity_from_parts():
+    identity = method_identity_from_parts("Lfoo/Bar;", "helper", ["J"], "Ljava/lang/String;")
+    assert identity == ("Lfoo/Bar;", "helper", ("J",), "Ljava/lang/String;")
+
+
+def test_method_identity_multiple_args():
+    identity = method_identity_from_parts("Ltest/Cls;", "m", ["I", "Ljava/lang/String;", "Z"], "V")
+    assert identity == ("Ltest/Cls;", "m", ("I", "Ljava/lang/String;", "Z"), "V")
+
+
+def test_targets_by_identity(sample_targets):
+    lookup = targets_by_identity(sample_targets)
+    assert len(lookup) == 2
+
+    identity_a = sample_targets[0].identity
+    identity_b = sample_targets[1].identity
+
+    assert lookup[identity_a] is sample_targets[0]
+    assert lookup[identity_b] is sample_targets[1]
+
+
+def test_targets_by_identity_duplicate_raises():
+    """Duplicate method identities should raise DiscoveryError."""
+    from paranoid_deobfuscator.paranoid.discovery import DiscoveryError
+
+    method = SmaliMethod("dup", arguments=["J"], return_type="Ljava/lang/String;", class_name="Lfoo/A;")
+    field = SmaliField("f", type="[Ljava/lang/String;", class_name="Lfoo/A;")
+    target = GetStringTarget(method=method, field=field, chunks=[])
+    with pytest.raises(DiscoveryError, match="Duplicate getString method"):
+        targets_by_identity([target, target])
+
+
+def test_get_string_target_identity(sample_targets):
+    t = sample_targets[0]
+    assert t.identity == method_identity(t.method)
+    assert t.method_signature == "Lcom/example/A;->a(J)Ljava/lang/String;"
+
+
+def test_get_string_target_repr():
+    method = SmaliMethod("m", arguments=["J"], return_type="Ljava/lang/String;", class_name="LFoo;")
+    field = SmaliField("f", type="[Ljava/lang/String;", class_name="LFoo;")
+    target = GetStringTarget(method=method, field=field, chunks=["chunk"])
+    assert repr(target).startswith("GetStringTarget(")
+    assert target.method is method
+    assert target.chunks == ["chunk"]
+
+
+@pytest.mark.parametrize("method", ["a", "getString", "helper"])
+def test_discover_targets_with_fixture(method, tmp_path):
+    """Create synthetic smali and verify discover_get_string_targets finds it."""
+    from paranoid_deobfuscator.constants import PARANOID_GET_STRING_CONST_SIGNATURE
+
+    const_lines = "\n".join(f"    const-wide v0, {c:#x}" for c in PARANOID_GET_STRING_CONST_SIGNATURE)
+
+    smali_content = f""".class public final Ltest/Target;
+.super Ljava/lang/Object;
+
+
+# static fields
+.field static final encryptedStrings:[Ljava/lang/String;
+
+
+# direct methods
+.method static constructor <clinit>()V
+    .locals 3
+
+    const/4 v0, 0x1
+    new-array v0, v0, [Ljava/lang/String;
+    const/4 v1, 0x0
+    const-string v2, "\\\\u0003foo\\\\u0003bar"
+    aput-object v2, v0, v1
+    sput-object v0, Ltest/Target;->encryptedStrings:[Ljava/lang/String;
+    return-void
+.end method
+
+.method public static {method}(J)Ljava/lang/String;
+    .locals 1
+
+{const_lines}
+
+    sget-object v0, Ltest/Target;->encryptedStrings:[Ljava/lang/String;
+
+    invoke-static {{v0}}, Lparanoid/Helper;->doSomething(J)Ljava/lang/String;
+
+    move-result-object v0
+
+    return-object v0
+.end method
+"""
+
+    target_dir = tmp_path / "smali"
+    target_dir.mkdir()
+    smali_file = target_dir / "Target.smali"
+    smali_file.write_text(smali_content, encoding="utf-8")
+
+    from paranoid_deobfuscator.paranoid.discovery import discover_get_string_targets
+
+    targets = discover_get_string_targets(target_dir)
+    assert len(targets) == 1
+    t = targets[0]
+    assert t.method.method == method
+    assert t.field.name == "encryptedStrings"
+    assert t.method_signature == f"Ltest/Target;->{method}(J)Ljava/lang/String;"
 
 
 # TODO: add tests for ParanoidSmaliParser
